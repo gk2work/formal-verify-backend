@@ -1,8 +1,0 @@
-# running in /Users/gautamthakur/Downloads/formal-verify/backend/data/formal_work/fv_c32158a8/assertions/fv_c32158a8__08__auto_assert_fifo_data_after_empty/fv_c32158a8__08__auto_assert_fifo_data_after_empty_bmc/model/
-read_rtlil design_prep.il
-hierarchy -smtcheck
-delete */t:$print
-formalff -assume
-dffunmap
-stat
-write_smt2 -wires design_smt2.smt2

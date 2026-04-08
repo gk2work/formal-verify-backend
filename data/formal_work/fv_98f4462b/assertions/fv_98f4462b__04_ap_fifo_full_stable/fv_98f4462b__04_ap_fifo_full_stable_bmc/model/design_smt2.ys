@@ -1,8 +1,0 @@
-# running in /Users/gautamthakur/Downloads/formal-verify/backend/data/formal_work/fv_98f4462b/assertions/fv_98f4462b__04_ap_fifo_full_stable/fv_98f4462b__04_ap_fifo_full_stable_bmc/model/
-read_rtlil design_prep.il
-hierarchy -smtcheck
-delete */t:$print
-formalff -assume
-dffunmap
-stat
-write_smt2 -wires design_smt2.smt2
