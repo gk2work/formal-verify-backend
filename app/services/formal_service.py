@@ -28,6 +28,7 @@ from datetime import datetime
 
 from app.services.sva_parser import parse_sva, format_parsed_summary
 from app.services.sva_lowering import SVALoweringEngine
+from app.services.sv_preprocessor import preprocess_files
 from app.services.sby_generator import (
     SbyConfig, SbyProject, SbyResult,
     generate_sby_project, quick_generate, quick_generate_standalone,
@@ -348,6 +349,10 @@ class FormalService:
         """
         aggregate = SbyResult(status="PASS")
         combined_logs = []
+        # Preprocess DUT for yosys compatibility
+        if dut_code:
+            from app.services.sv_preprocessor import preprocess
+            dut_code = preprocess(dut_code, dut_filename)
         actual_dut_top = (dut_top or self._extract_module_name(dut_code)) if dut_code else ""
         parent_dir = FORMAL_WORK_DIR / project_name
         assertions_dir = parent_dir / "assertions"
@@ -538,6 +543,10 @@ def run_formal_direct(
 
     t0 = time.time()
     try:
+        # Preprocess for yosys compatibility (packed 2D arrays, localparam logic, etc.)
+        design_file_contents = preprocess_files(design_file_contents)
+        sva_file_contents = preprocess_files(sva_file_contents)
+
         project = generate_raw_sby_project(
             design_file_contents=design_file_contents,
             sva_file_contents=sva_file_contents,

@@ -165,14 +165,14 @@ def _generate_sby_config(
 
     for f in dut_files:
         fname = f.split("/")[-1]  # strip src/ prefix
-        lines.append(f"read -formal {fname}")
+        lines.append(f"read -sv -formal {fname}")
 
     monitor_fname = monitor_file.split("/")[-1]
-    lines.append(f"read -formal {monitor_fname}")
+    lines.append(f"read -sv -formal {monitor_fname}")
 
     has_wrapper = bool(has_wrapper and config.top_module and config.monitor_module)
     if has_wrapper:
-        lines.append(f"read -formal formal_wrapper.sv")
+        lines.append(f"read -sv -formal formal_wrapper.sv")
         lines.append(f"prep -top formal_wrapper")
     elif config.top_module:
         lines.append(f"prep -top {config.top_module}")
@@ -559,7 +559,7 @@ def quick_generate_standalone(
         f"{config.engine}" + (f" {config.solver}" if config.solver else ""),
         "",
         "[script]",
-        f"read -formal {monitor_filename}",
+        f"read -sv -formal {monitor_filename}",
         f"prep -top {parsed.module_name}",
         "",
         "[files]",
@@ -615,7 +615,7 @@ def generate_raw_sby_project(
     if solver:
         engine_line += f" {solver}"
 
-    script_lines = [f"read -formal {fn}" for fn in all_filenames]
+    script_lines = [f"read -sv -formal {fn}" for fn in all_filenames]
     if top_module:
         script_lines.append(f"prep -top {top_module}")
     else:
@@ -712,7 +712,7 @@ def generate_standalone_project_from_monitor(
         f"{config.engine}" + (f" {config.solver}" if config.solver else ""),
         "",
         "[script]",
-        f"read -formal {monitor_filename}",
+        f"read -sv -formal {monitor_filename}",
         f"prep -top {top_module}",
         "",
         "[files]",
