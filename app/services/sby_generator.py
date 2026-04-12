@@ -435,18 +435,39 @@ def _resolve_monitor_signal(
     actual_reset: str,
 ) -> Optional[str]:
     """Map lowered monitor signal names back to DUT or wrapper signals."""
+    # 1. Exact match
     if monitor_name in dut_port_names:
         return monitor_name
-    if monitor_name == "clk_in":
+
+    # 2. Always map clock/reset names to the wrapper's fixed ports — never anyseq
+    _CLOCK_NAMES = {"clk", "clock", "clk_in", "clk_i", "clk_out"}
+    _RESET_NAMES = {"rst_n", "rst", "reset", "reset_n", "rst_n_in"}
+    if monitor_name == actual_clock or monitor_name in _CLOCK_NAMES:
         return actual_clock or "clk"
-    if monitor_name == "rst_n_in":
+    if monitor_name == actual_reset or monitor_name in _RESET_NAMES:
         return actual_reset or "rst_n"
 
+    # 3. Strip _in / _out suffix and retry exact match
+    #    e.g. gen_in → gen
     for suffix in ("_in", "_out"):
         if monitor_name.endswith(suffix):
             candidate = monitor_name[: -len(suffix)]
             if candidate in dut_port_names:
                 return candidate
+
+    # 4. Underscore-normalized match: data_in → datain, data_out → dataout
+    #    Build a lookup from normalized DUT name → original DUT name
+    normalized_dut = {name.replace("_", "").lower(): name for name in dut_port_names}
+    monitor_normalized = monitor_name.replace("_", "").lower()
+    if monitor_normalized in normalized_dut:
+        return normalized_dut[monitor_normalized]
+
+    # 5. Strip _in / _out then normalize
+    for suffix in ("_in", "_out"):
+        if monitor_name.endswith(suffix):
+            candidate_normalized = monitor_name[: -len(suffix)].replace("_", "").lower()
+            if candidate_normalized in normalized_dut:
+                return normalized_dut[candidate_normalized]
 
     return None
 
@@ -829,6 +850,14 @@ def parse_sby_output(stdout: str, stderr: str, returncode: int, work_dir: str) -
     result.assertion_results = _parse_assertion_results_from_junit(
         detailed_logs.get("junit_xml", "")
     )
+
+    # Don't trust PASS entries from JUnit XML when sby itself errored —
+    # sby may emit empty testcase elements (parsed as PASS) for assertions
+    # that were never reached because prep/elaboration failed.
+    if result.status == "ERROR" and result.assertion_results:
+        for a in result.assertion_results:
+            if a.get("status") == "PASS":
+                a["status"] = "ERROR"
 
     # Fallback: extract per-property rows from engine/sby logs when no JUnit XML.
     if not result.assertion_results:
