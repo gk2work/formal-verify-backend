@@ -52,6 +52,21 @@ class SbyProject:
     config: SbyConfig
 
 
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent space and special character syntax errors in .sby configs."""
+    if not filename:
+        return "dut.sv"
+    base = os.path.basename(filename)
+    name, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".sv"
+    clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
+    clean_name = re.sub(r'_+', '_', clean_name).strip('_')
+    if not clean_name:
+        clean_name = "dut"
+    return f"{clean_name}{ext}"
+
+
 def generate_sby_project(
     config: SbyConfig,
     dut_contents: dict[str, str],    # {filename: content}
@@ -70,6 +85,9 @@ def generate_sby_project(
     Returns:
         SbyProject with paths to all generated files
     """
+    # Sanitize DUT filenames to prevent spaces/special chars from breaking .sby syntax
+    dut_contents = {sanitize_filename(fname): content for fname, content in dut_contents.items()}
+
     # Create work directory
     if work_dir:
         project_dir = Path(work_dir)
@@ -210,10 +228,15 @@ def _generate_wrapper(
         return None
 
     # Extract DUT ports by parsing the first DUT file
-    dut_ports = _extract_module_ports(list(dut_contents.values())[0], config.top_module)
+    dut_code = list(dut_contents.values())[0]
+    dut_ports = _extract_module_ports(dut_code, config.top_module)
     if not dut_ports:
         logger.warning(f"Could not extract ports from DUT module '{config.top_module}'")
         return None
+
+    # Extract parameter defaults so the wrapper can emit localparams,
+    # making parameterized width expressions (e.g. [DWIDTH-1:0]) evaluable.
+    dut_params = _extract_module_params(dut_code, config.top_module)
 
     dut_port_names = {port["name"] for port in dut_ports}
     actual_clock, actual_reset = _pick_clock_reset_ports(dut_ports)
@@ -226,6 +249,14 @@ def _generate_wrapper(
     lines.append(f");")
     lines.append("")
 
+    # Emit localparams for every DUT parameter so parameterized width
+    # expressions like [DWIDTH-1:0] are evaluable by yosys in this wrapper.
+    if dut_params:
+        for pname, pval in dut_params.items():
+            lines.append(f"    localparam {pname} = {pval};")
+        lines.append("")
+
+    # Alias wrapper ports to DUT's actual clock/reset names so .* connects them
     if actual_clock and actual_clock != "clk":
         lines.append(f"    wire {actual_clock} = clk;")
     if actual_reset and actual_reset != "rst_n":
@@ -233,17 +264,14 @@ def _generate_wrapper(
     if actual_clock or actual_reset:
         lines.append("")
 
-    # Declare wires for all DUT ports (except clk/rst)
+    # Declare wires for all non-clock/non-reset DUT ports so .* can bind them.
+    # Keep parameterized widths as-is — the localparams above make them valid.
+    declared_wires: set[str] = {actual_clock or "clk", actual_reset or "rst_n", "clk", "rst_n"}
     for port in dut_ports:
-        if port["name"] in {"clk", "rst_n", "rst", "reset", actual_clock, actual_reset}:
+        if port["name"] in declared_wires:
             continue
+        declared_wires.add(port["name"])
         width = port.get("width", "")
-        # Resolve parameterized widths to safe defaults for formal
-        # If width contains non-numeric characters (like $clog2, WIDTH, DEPTH),
-        # replace with a reasonable default
-        if width and not re.match(r'^\[\s*\d+\s*:\s*\d+\s*\]$', width):
-            # Try to evaluate simple expressions, otherwise use [7:0]
-            width = "[7:0]"
         width_str = f"{width} " if width else ""
         if port["direction"] == "output":
             lines.append(f"    wire {width_str}{port['name']};")
@@ -252,47 +280,53 @@ def _generate_wrapper(
 
     lines.append("")
 
-    # Instantiate DUT — use .* for parameterized modules to avoid width mismatches
+    # Instantiate DUT using .* — robust against multi-port declarations and
+    # parameterised widths that the regex parser may miss.
     lines.append(f"    {config.top_module} u_dut (")
-    port_connections = []
-    for port in dut_ports:
-        port_connections.append(f"        .{port['name']}({port['name']})")
-    lines.append(",\n".join(port_connections))
+    lines.append(f"        .*")
     lines.append(f"    );")
     lines.append("")
 
-    # Instantiate monitor — connect only monitor ports (subset of DUT ports)
+    # Instantiate monitor — connect each port explicitly via signal resolution
     monitor_ports = _extract_module_ports(monitor_content, config.monitor_module)
+    extra_monitor_decls = []
+    mon_connections = []
+
     if monitor_ports:
-        mon_connections = []
-        extra_monitor_decls = []
         for port in monitor_ports:
-            resolved_name = _resolve_monitor_signal(port["name"], dut_port_names, actual_clock, actual_reset)
+            resolved_name = _resolve_monitor_signal(
+                port["name"], dut_port_names, actual_clock, actual_reset
+            )
             if resolved_name is None:
-                width = port.get("width", "")
-                if width and not re.match(r'^\[\s*\d+\s*:\s*\d+\s*\]$', width):
-                    width = "[7:0]"
-                width_str = f"{width} " if width else ""
-                extra_monitor_decls.append(f"    (* anyseq *) wire {width_str}{port['name']};")
+                # Signal not in DUT — declare a free anyseq wire for it
+                if port["name"] not in declared_wires:
+                    declared_wires.add(port["name"])
+                    width = port.get("width", "")
+                    if width and not re.match(r'^\[\s*\d+\s*:\s*\d+\s*\]$', width):
+                        width = "[7:0]"
+                    width_str = f"{width} " if width else ""
+                    extra_monitor_decls.append(
+                        f"    (* anyseq *) wire {width_str}{port['name']};"
+                    )
                 resolved_name = port["name"]
+            mon_connections.append(f"        .{port['name']}({resolved_name})")
+
         if extra_monitor_decls:
             lines.extend(extra_monitor_decls)
             lines.append("")
+
         lines.append(f"    {config.monitor_module} u_monitor (")
-        for port in monitor_ports:
-            resolved_name = _resolve_monitor_signal(port["name"], dut_port_names, actual_clock, actual_reset)
-            if resolved_name is None:
-                resolved_name = port["name"]
-            mon_connections.append(f"        .{port['name']}({resolved_name})")
         lines.append(",\n".join(mon_connections))
     else:
         lines.append(f"    {config.monitor_module} u_monitor (")
         lines.append(f"        .*")
+
     lines.append(f"    );")
     lines.append("")
 
-    # Initial reset assumption: rst_n must be low at step 0
-    # This ensures DUT registers initialize before assertions fire
+    # Assume reset is active for at least the first cycle so DUT registers
+    # initialise before assertions fire.  Target the DUT's actual reset name.
+    reset_port = actual_reset or "rst_n"
     lines.append(f"    // Assume reset is active for at least the first cycle")
     lines.append(f"    reg _va_past_valid;")
     lines.append(f"    always @(posedge clk) begin")
@@ -302,7 +336,7 @@ def _generate_wrapper(
     lines.append(f"    initial _va_past_valid = 0;")
     lines.append(f"    always @(*) begin")
     lines.append(f"        if (!_va_past_valid)")
-    lines.append(f"            assume(!{actual_reset or 'rst_n'});")
+    lines.append(f"            assume(!{reset_port});")
     lines.append(f"    end")
     lines.append("")
 
@@ -335,23 +369,76 @@ def _extract_module_ports(code: str, module_name: str) -> list[dict]:
             return []
 
     port_text = m.group(1)
+    # Strip // line comments and /* block comments */ before tokenising
+    port_text_clean = re.sub(r'//[^\n]*', '', port_text)
+    port_text_clean = re.sub(r'/\*[\s\S]*?\*/', '', port_text_clean)
     ports = []
 
-    # Match ports with optional width containing expressions like $clog2(DEPTH)
-    port_pattern = re.compile(
-        r'(input|output|inout)\s+'
-        r'(?:(wire|logic|reg)\s+)?'
-        r'(\[[\s\S]*?\]\s+)?'       # width — now handles $clog2(X):0 etc.
-        r'(\w+)'
+    # Token-stream parser for ANSI-style port lists.
+    # Handles all of:
+    #   input rstn, clk, wr_en, rd_en,
+    #   input [DWIDTH-1:0] din,
+    #   output reg [DWIDTH-1:0] dout,
+    #   output empty, full
+    #
+    # Algorithm: scan tokens left-to-right, tracking the "current direction"
+    # and "current width".  A direction keyword resets both.  Every identifier
+    # token that follows a direction (directly or after a width) is a port name.
+    KEYWORDS = {"input", "output", "inout", "wire", "logic", "reg", "signed", "unsigned"}
+    DIRECTIONS = {"input", "output", "inout"}
+
+    # Tokenise: direction/type keywords, [width] brackets, identifiers, commas
+    token_re = re.compile(
+        r'\[([^\]]*)\]'           # bracket width group (group 1)
+        r'|(input|output|inout|wire|logic|reg|signed|unsigned)'  # keyword (group 2)
+        r'|(\b\w+\b)'             # identifier (group 3)
+        r'|([,;])',               # punctuation (group 4)
+        re.IGNORECASE
     )
 
-    for pm in port_pattern.finditer(port_text):
-        ports.append({
-            "direction": pm.group(1),
-            "type": pm.group(2) or "wire",
-            "width": pm.group(3).strip() if pm.group(3) else "",
-            "name": pm.group(4),
-        })
+    cur_dir   = None
+    cur_type  = "wire"
+    cur_width = ""
+    seen_names: set[str] = set()
+
+    for tok in token_re.finditer(port_text_clean):
+        bracket, keyword, ident, punct = tok.groups()
+
+        if bracket is not None:
+            cur_width = f"[{bracket}]"
+            continue
+
+        if keyword is not None:
+            kw = keyword.lower()
+            if kw in DIRECTIONS:
+                cur_dir   = kw
+                cur_type  = "wire"
+                cur_width = ""
+            elif kw in {"wire", "logic", "reg"}:
+                cur_type = kw
+            # signed/unsigned: ignore, leave width as-is
+            continue
+
+        if ident is not None:
+            if cur_dir and ident not in KEYWORDS and ident not in seen_names:
+                seen_names.add(ident)
+                ports.append({
+                    "direction": cur_dir,
+                    "type":      cur_type,
+                    "width":     cur_width,
+                    "name":      ident,
+                })
+            # After seeing a name, the width does NOT reset — same width applies
+            # to sibling names.  But direction stays too.
+            continue
+
+        if punct == ";" or punct == ",":
+            # comma: next ident gets same dir/type/width
+            # semicolon: end of declaration
+            if punct == ";":
+                cur_dir = None
+                cur_width = ""
+            continue
 
     if ports:
         return ports
@@ -361,6 +448,36 @@ def _extract_module_ports(code: str, module_name: str) -> list[dict]:
         return []
 
     return _extract_non_ansi_port_decls(code, header_names)
+
+
+def _extract_module_params(code: str, module_name: str) -> dict[str, str]:
+    """Extract parameter names and their default values from a module's #() block.
+
+    For:  module fifo #(parameter DEPTH=8, DWIDTH=16) (...)
+    Returns: {"DEPTH": "8", "DWIDTH": "16"}
+    """
+    # Match the #(…) parameter block
+    pat = re.compile(
+        rf'module\s+{re.escape(module_name)}\s*#\s*\(([^)]+)\)',
+        re.MULTILINE
+    )
+    m = pat.search(code)
+    if not m:
+        return {}
+
+    param_text = m.group(1)
+    # Strip comments
+    param_text = re.sub(r'//[^\n]*', '', param_text)
+    param_text = re.sub(r'/\*[\s\S]*?\*/', '', param_text)
+
+    params: dict[str, str] = {}
+    # Match:  [parameter] NAME = VALUE
+    for pm in re.finditer(r'(?:parameter\s+)?(\w+)\s*=\s*([^,\s]+)', param_text):
+        pname = pm.group(1)
+        pval  = pm.group(2).strip()
+        if pname.lower() != "parameter":
+            params[pname] = pval
+    return params
 
 
 def _extract_header_port_names(port_text: str) -> list[str]:
@@ -424,7 +541,7 @@ def _pick_clock_reset_ports(dut_ports: list[dict]) -> tuple[str, str]:
         return default
 
     clock_name = pick(["clk", "clock", "clk_in", "clk_i"], "clk")
-    reset_name = pick(["rst_n", "reset_n", "rst", "reset", "rst_n_in"], "rst_n")
+    reset_name = pick(["rst_n", "rstn", "reset_n", "rst", "reset", "rst_n_in"], "rst_n")
     return clock_name, reset_name
 
 
@@ -441,7 +558,7 @@ def _resolve_monitor_signal(
 
     # 2. Always map clock/reset names to the wrapper's fixed ports — never anyseq
     _CLOCK_NAMES = {"clk", "clock", "clk_in", "clk_i", "clk_out"}
-    _RESET_NAMES = {"rst_n", "rst", "reset", "reset_n", "rst_n_in"}
+    _RESET_NAMES = {"rst_n", "rstn", "rst", "reset", "reset_n", "rst_n_in"}
     if monitor_name == actual_clock or monitor_name in _CLOCK_NAMES:
         return actual_clock or "clk"
     if monitor_name == actual_reset or monitor_name in _RESET_NAMES:
@@ -904,7 +1021,7 @@ def _collect_sby_logs(work_dir: str) -> tuple[dict[str, str], dict[str, str]]:
         if entry.is_dir() and os.path.isfile(os.path.join(entry.path, "logfile.txt")):
             task_dirs.append(entry.path)
 
-    task_dir = max(task_dirs, key=os.path.getmtime) if task_dirs else ""
+    task_dir = str(max(task_dirs, key=os.path.getmtime)) if task_dirs else ""
     if task_dir:
         paths["task_dir"] = task_dir
         _read_log_file(task_dir, "logfile.txt", "sby_log", logs, paths)

@@ -17,7 +17,7 @@ GET  /api/formal/health           — Formal subsystem health check
 import logging
 import os
 import uuid
-from typing import Optional, List
+from typing import Optional, List, Any
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, UploadFile
 from pydantic import BaseModel, Field
 
@@ -461,8 +461,8 @@ async def get_counterexample(job_id: str, assertion: str = Query(default="")):
     if not job:
         return {"error": "Job not found"}
 
-    if not job.result or job.result.status != "FAIL":
-        return {"error": "No counterexample available (job did not FAIL)"}
+    if not job.result:
+        return {"error": "No formal result available for this job"}
 
     selected_assertion, vcd_path = _resolve_counterexample_trace(job, assertion)
     if not vcd_path:
@@ -517,7 +517,7 @@ async def formal_health():
 
 def _job_to_response(job: FormalJob) -> dict:
     """Convert a FormalJob to an API response dict."""
-    response = {
+    response: dict[str, Any] = {
         "job_id": job.job_id,
         "status": job.status,
         "mode": job.mode,
@@ -538,7 +538,7 @@ def _job_to_response(job: FormalJob) -> dict:
 
     if job.result:
         r = job.result
-        response["result"] = {
+        result_dict: dict[str, Any] = {
             "status": r.status,
             "depth_reached": r.depth_reached,
             "elapsed_seconds": round(r.elapsed_seconds, 3),
@@ -567,13 +567,14 @@ def _job_to_response(job: FormalJob) -> dict:
                 "junit_xml": r.detailed_logs.get("junit_xml", ""),
             },
         }
+        response["result"] = result_dict
 
         if r.engine_output:
             output_lines = r.engine_output.strip().split("\n")
-            response["result"]["engine_summary"] = output_lines[-20:]
+            result_dict["engine_summary"] = output_lines[-20:]
         elif r.detailed_logs.get("sby_log"):
             output_lines = r.detailed_logs["sby_log"].strip().split("\n")
-            response["result"]["engine_summary"] = output_lines[-20:]
+            result_dict["engine_summary"] = output_lines[-20:]
 
     if job.lowered_rtl:
         response["has_lowered_rtl"] = True
@@ -646,6 +647,7 @@ def _candidate_trace_paths(job: FormalJob, assertion: dict) -> list[str]:
 
     base_dirs = [
         assertion.get("project_dir") or "",
+        assertion.get("log_paths", {}).get("task_dir", ""),
         job.result.log_paths.get("task_dir", "") if job.result else "",
         job.sby_project_dir or "",
     ]

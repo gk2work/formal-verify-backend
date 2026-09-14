@@ -18,7 +18,7 @@ Collections:
 import logging
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import chromadb
 from chromadb.config import Settings
@@ -67,10 +67,10 @@ class RAGService:
     ):
         self.persist_dir = persist_dir
         self.embed = embed_service or embedding_service
-        self._client: Optional[chromadb.PersistentClient] = None
+        self._client: Optional[Any] = None
         self._collections: dict = {}
 
-    def _get_client(self) -> chromadb.PersistentClient:
+    def _get_client(self) -> Any:
         """Lazy-initialize ChromaDB client."""
         if self._client is None:
             Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
@@ -143,7 +143,7 @@ class RAGService:
             try:
                 # Truncate very long chunks (Ollama embedding limit)
                 truncated = doc[:8000] if len(doc) > 8000 else doc
-                emb = embed_fn(truncated)
+                emb = await self.embed.embed_text(truncated)
                 embeddings.append(emb)
             except Exception as e:
                 logger.warning(f"  Skipping chunk {i} (embed failed): {e}")
@@ -286,14 +286,14 @@ class RAGService:
                 if collection.count() == 0:
                     continue
 
-                query_params = {
+                query_params: dict[str, Any] = {
                     "query_embeddings": [query_embedding],
                     "n_results": min(top_k, collection.count()),
                 }
 
                 # Apply metadata filters if provided
                 if filter_metadata:
-                    where = {}
+                    where: dict[str, Any] = {}
                     for k, v in filter_metadata.items():
                         where[k] = v
                     query_params["where"] = where

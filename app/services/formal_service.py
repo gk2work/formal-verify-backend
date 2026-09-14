@@ -22,7 +22,7 @@ import logging
 import shutil
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -364,15 +364,30 @@ class FormalService:
         aggregate.log_paths["job_dir"] = str(parent_dir)
         aggregate.log_paths["assertions_dir"] = str(assertions_dir)
 
+        # Build a label→type map once so cover labels get the right type in fallback dicts
+        label_types = self._label_type_map(lowered_rtl)
+
         for index, label in enumerate(assert_labels, start=1):
             isolated_monitor = self._disable_other_assertions(lowered_rtl, label)
             run_name = f"{project_name}__{index:02d}_{label}"[:96]
             run_dir = assertions_dir / run_name
 
+            # Cover witness points must always use cover mode.
+            # Assert/assume labels use the user-chosen mode, EXCEPT when the user
+            # chose 'cover' — smtbmc skips all assert() stmts in cover mode, so
+            # fall back to 'bmc' so they still get checked.
+            label_kind = label_types.get(label, "ASSERT")
+            if label_kind == "COVER":
+                run_mode = "cover"
+            elif mode == "cover":
+                run_mode = "bmc"  # assertions can't be proved in cover mode
+            else:
+                run_mode = mode
+
             if dut_code:
                 config = SbyConfig(
                     project_name=run_name,
-                    mode=mode,
+                    mode=run_mode,
                     depth=depth,
                     engine="smtbmc",
                     solver=solver,
@@ -389,25 +404,31 @@ class FormalService:
                 project = generate_standalone_project_from_monitor(
                     monitor_rtl=isolated_monitor,
                     top_module=parsed_module,
-                    mode=mode,
+                    mode=run_mode,
                     depth=depth,
                     solver=solver,
                     project_name=run_name,
                     work_dir=str(run_dir),
                 )
 
-            logger.info(f"[{project_name}] Staged isolated run for {label}: {project.work_dir}")
+            logger.info(f"[{project_name}] Staged isolated {label_kind} run for {label}: {project.work_dir}")
             run_result = self._run_sby(project.sby_file, project.work_dir, timeout)
 
-            selected = next(
-                (a for a in run_result.assertion_results if a["name"] == label),
+            # JUnit XML from sby uses fully-qualified names such as
+            # "formal_wrapper.u_monitor.wp_fifo_full". Try an exact match
+            # first, then fall back to a suffix match on the bare label.
+            selected: Optional[dict[str, Any]] = next(
+                (
+                    a for a in run_result.assertion_results
+                    if a["name"] == label or a["name"].endswith(f".{label}")
+                ),
                 None,
             )
             if not selected:
                 selected = {
                     "name": label,
                     "status": run_result.status if run_result.status in {"PASS", "FAIL", "ERROR", "TIMEOUT"} else "ERROR",
-                    "type": "ASSERT",
+                    "type": label_kind,  # Correctly ASSERT or COVER, not always ASSERT
                     "location": "",
                     "file": "",
                     "line": 0,
@@ -452,19 +473,27 @@ class FormalService:
         return aggregate
 
     def _extract_lowered_assert_labels(self, lowered_rtl: str) -> list[str]:
-        """Return the labels of actual lowered assert statements."""
-        return re.findall(r'^\s*(\w+):\s*assert\s*\(', lowered_rtl, re.MULTILINE)
+        """Return the labels of all lowered assert/cover statements (preserving order)."""
+        return re.findall(r'^\s*(\w+):\s*(?:assert|cover)\s*\(', lowered_rtl, re.MULTILINE)
+
+    def _label_type_map(self, lowered_rtl: str) -> dict[str, str]:
+        """Return a mapping of label -> 'ASSERT' | 'COVER' from the lowered RTL."""
+        result = {}
+        for m in re.finditer(r'^\s*(\w+):\s*(assert|cover)\s*\(', lowered_rtl, re.MULTILINE):
+            result[m.group(1)] = "COVER" if m.group(2) == "cover" else "ASSERT"
+        return result
 
     def _disable_other_assertions(self, lowered_rtl: str, active_label: str) -> str:
-        """Disable all lowered assert statements except the selected one."""
+        """Disable all lowered assert/cover statements except the selected one."""
         lines = []
-        pattern = re.compile(r'^(\s*)(\w+):\s*assert\s*\(')
+        pattern = re.compile(r'^(\s*)(\w+):\s*(assert|cover)\s*\(')
         for line in lowered_rtl.splitlines():
             m = pattern.match(line)
             if m and m.group(2) != active_label:
                 indent = m.group(1)
                 label = m.group(2)
-                lines.append(f"{indent}begin end // disabled assertion {label}")
+                kind = m.group(3)  # "assert" or "cover"
+                lines.append(f"{indent}begin end // disabled {kind} {label}")
             else:
                 lines.append(line)
         return "\n".join(lines)
